@@ -497,3 +497,148 @@ def run(bytecode: bytes, max_steps: int, max_gas: int) -> int:
             raise E("underflow") 
 
 ```
+
+
+# Validation Layer Assisted Claude Sonnet 5.5 Revised Response 
+
+``` 
+
+def run(bytecode: bytes, max_steps: int, max_gas: int) -> int:
+    E = ValueError
+    try:  # validation, execution and fault handling are all covered by the final except
+        if not isinstance(bytecode, (bytes, bytearray)): raise E
+        for q in (max_steps, max_gas):
+            if not isinstance(q, int) or isinstance(q, bool): raise E
+        max_steps = int.__add__(max_steps, 0); max_gas = int.__add__(max_gas, 0)  # exact ints, ignoring subclass overrides
+        if max_steps < 0 or max_gas < 0: raise E
+        with memoryview(bytecode) as mv:  # check the size before copying or allocating anything
+            n = len(mv)
+            if n > 1 << 20: raise E
+            bc = bytes(mv)
+        COST = (1,2,3,3,3,3,3,1,1,2,2,2,2,2,1,2,1,3,3,3,3,3,3,3,3,3,3,2,2,3,3,4,3,3,2,2,3,2,1,2)
+        H = 1 << 63; M = (1 << 64) - 1
+        # flat per-offset tables: opcode (255 = not an instruction start), length, int64 operand
+        ops = bytearray(b'\xff') * (n + 1); ln = bytearray(n + 1)
+        arg = memoryview(bytearray(8 * (n + 1))).cast('q')
+        i = 0
+        while i < n:
+            o = bc[i]
+            if o > 39: raise E
+            v = 0; j = i + 1
+            if o == 1:
+                s = 0
+                for k in range(1, 11):
+                    if j >= n: raise E
+                    x = bc[j]; j += 1; v |= (x & 127) << s; s += 7
+                    if x < 128: break
+                else: raise E
+                if x & 64: v -= 1 << s
+                # int64 range, and canonical: a k-byte encoding must not fit in k-1 bytes
+                if not -H <= v < H or (k > 1 and -(1 << (7 * k - 8)) <= v < (1 << (7 * k - 8))): raise E
+            elif o in (9, 10, 11, 15, 37):
+                if j + 4 > n: raise E
+                v = int.from_bytes(bc[j:j + 4], 'little'); j += 4
+            elif o in (27, 28):
+                if j >= n: raise E
+                v = bc[j]; j += 1
+            ops[i] = o; ln[i] = j - i; arg[i] = v; i = j
+        for i, o in enumerate(ops):
+            if o in (9, 10, 11, 15, 37) and (arg[i] >= n or ops[arg[i]] == 255): raise E
+        del bc
+        st = []; cs = []; hs = []; mem = [0] * 256; pc = steps = gas = 0
+        pop = st.pop; push = st.append
+        class F(Exception): pass
+        while True:
+            try:
+                while True:
+                    if pc >= n or steps >= max_steps: raise E
+                    o = ops[pc]; steps += 1; gas += COST[o]
+                    if gas > max_gas: raise E
+                    if o == 1:
+                        if len(st) > 1023: raise E
+                        push(arg[pc])
+                    elif o == 2: b = pop(); a = pop(); push((a + b + H & M) - H)
+                    elif o == 7:
+                        if len(st) > 1023: raise E
+                        push(st[-1])
+                    elif o == 11:
+                        if pop(): pc = arg[pc]; continue
+                    elif o == 10:
+                        if not pop(): pc = arg[pc]; continue
+                    elif o == 9: pc = arg[pc]; continue
+                    elif o == 3: b = pop(); a = pop(); push((a - b + H & M) - H)
+                    elif o == 8: st[-1], st[-2] = st[-2], st[-1]
+                    elif o == 14: pop()
+                    elif o == 12:
+                        a = pop()
+                        if not 0 <= a < 256: raise F(3)
+                        push(mem[a])
+                    elif o == 13:
+                        a = pop(); x = pop()
+                        if not 0 <= a < 256: raise F(3)
+                        mem[a] = x
+                    elif o == 4: b = pop(); a = pop(); push((a * b + H & M) - H)
+                    elif o == 5 or o == 6:
+                        b = pop(); a = pop()
+                        if b == 0: raise F(1)
+                        r = abs(a) // abs(b) if o == 5 else abs(a) % abs(b)
+                        neg = (a < 0) != (b < 0) if o == 5 else a < 0
+                        push(((-r if neg else r) + H & M) - H)
+                    elif 24 <= o <= 26:
+                        b = pop(); a = pop()
+                        push(int(a == b if o == 24 else a < b if o == 25 else a > b))
+                    elif 17 <= o <= 19:
+                        b = pop(); a = pop()
+                        push(a & b if o == 17 else a | b if o == 18 else a ^ b)
+                    elif o == 20: push(~pop())
+                    elif 21 <= o <= 23:
+                        b = pop(); a = pop()
+                        if not 0 <= b < 64: raise F(2)
+                        push(((a << b if o == 21 else (a & M) >> b if o == 22 else a >> b) + H & M) - H)
+                    elif o == 27:
+                        v = arg[pc]
+                        if len(st) <= v or len(st) > 1023: raise E
+                        push(st[-1 - v])
+                    elif o == 28:
+                        v = arg[pc]; gas += v
+                        if gas > max_gas: raise E
+                        push(pop(-1 - v))
+                    elif o == 15 or o == 29 or o == 30:
+                        if o == 15: t = arg[pc]
+                        else:
+                            t = pop()
+                            if not 0 <= t < n or ops[t] == 255: raise E
+                        if o != 29:
+                            if len(cs) >= 1024: raise E
+                            cs.append(pc + ln[pc])
+                        pc = t; continue
+                    elif o == 16: pc = cs.pop(); continue
+                    elif o == 31: b = pop(); a = pop(); push(a * b >> 64)
+                    elif o == 32 or o == 33:
+                        b = pop(); a = pop() & M; k = b & 63 if o == 32 else -b & 63  # ROTR = ROTL by -b
+                        push(((a << k | a >> 64 - k) + H & M) - H)
+                    elif o == 34: push(64 - (pop() & M).bit_length())
+                    elif o == 35: push((pop() & M).bit_count())
+                    elif o == 36:
+                        if len(st) >= 3 and 0 <= st[-1] <= 256:
+                            gas += st[-1]
+                            if gas > max_gas: raise E
+                        l = pop(); s = pop(); d = pop()
+                        if l < 0 or s < 0 or d < 0 or s + l > 256 or d + l > 256: raise F(3)
+                        mem[d:d + l] = mem[s:s + l]
+                    elif o == 37:
+                        if len(hs) >= 256: raise E
+                        hs.append((arg[pc], len(st), len(cs)))
+                    elif o == 38: hs.pop()
+                    elif o == 39: raise F(pop())
+                    elif o == 0: return st[-1] if st else 0
+                    else: raise E
+                    pc += ln[pc]
+            except F as e:
+                if not hs: raise E
+                pc, h, d = hs.pop(); del st[h:]; del cs[d:]
+                if len(st) > 1023: raise E
+                push(e.args[0])
+    except Exception: raise E from None
+    
+```
